@@ -1,14 +1,21 @@
-import torch
+"""
+ROSA Suffix Automaton (SAM) Context and Worker.
+"""
 
-from torch import Tensor
-from typing import *
-
-from functools import lru_cache
 from contextlib import contextmanager
+from functools import lru_cache
+from typing import Dict, Optional, Tuple, Union
 
-from .ops import *
-from .utils import quantize, dequantize
+import torch
+from torch import Tensor
 
+from .ops import (
+    rosa_sam_free,
+    rosa_sam_init,
+    rosa_sam_inspect,
+    rosa_sam_update,
+)
+from .utils import dequantize, quantize
 
 __all__ = [
     "RosaWork",
@@ -17,12 +24,14 @@ __all__ = [
 
 
 class RosaWork:
+    """Handler for asynchronous SAM operations."""
+
     def __init__(self):
-        self._ctx: RosaContext
-        self._qkv: Tuple[Tensor, Tensor, Tensor, int]
+        self._ctx: Optional["RosaContext"] = None
+        self._qkv: Optional[Tuple[Tensor, Tensor, Tensor, int]] = None
         self._inspect: bool = False
-    
-    def wait(self):
+
+    def wait(self) -> Union[Tensor, Tuple[Tensor, Dict[str, Tensor]]]:
         if self._ctx is None:
             raise RuntimeError("wait() called twice")
         ctx = self._ctx
@@ -38,19 +47,22 @@ class RosaWork:
 
 
 class RosaContext:
+    """Manages the state of the ROSA SAM."""
+
     def __init__(self):
-        self._sam: RosaSAM | None = None
-    
-    def update(self,
+        self._sam: Optional["RosaSAM"] = None
+
+    def update(
+        self,
         query: Tensor,
         key: Tensor,
         value: Tensor,
         mismatch: int = 0,
         inspect: bool = False,
         async_op: bool = False,
-    ) -> Union[Tensor, Tuple[Tensor, Dict[str, Tensor]]]:
+    ) -> Union[RosaWork, Tuple[Tensor, Dict[str, Tensor]]]:
         xq, xk, xv = self._dispatch(query=query, key=key, value=value)
-        
+
         work = RosaWork()
         work._ctx = self
         work._qkv = (xq, xk, xv, mismatch)
@@ -59,16 +71,20 @@ class RosaContext:
         if async_op:
             return work
         return work.wait()
-    
+
     def _init_sam(self, query: Tensor, key: Tensor, value: Tensor):
         bsz, num_q_heads, seq_len, num_q_bits = query.size()
         bsz, num_k_heads, seq_len, num_k_bits = key.size()
         bsz, num_v_heads, seq_len, num_v_bits = value.size()
 
-        assert num_k_heads == num_v_heads, f"Key and value must have the same number of heads, got {num_k_heads} and {num_v_heads}."
-        assert num_q_bits == num_k_bits, f"Query and key must have the same bit width, got {num_q_bits} and {num_k_bits}."
-        assert num_k_bits <= 64, f"Unsupported bit width for key: {num_k_bits}."
-        assert num_v_bits <= 64, f"Unsupported bit width for value: {num_v_bits}."
+        assert (
+            num_k_heads == num_v_heads
+        ), f"Key and value heads mismatch: {num_k_heads} vs {num_v_heads}"
+        assert (
+            num_q_bits == num_k_bits
+        ), f"Query/Key bit width mismatch: {num_q_bits} vs {num_k_bits}"
+        assert num_k_bits <= 64, f"Unsupported key bit width: {num_k_bits}"
+        assert num_v_bits <= 64, f"Unsupported value bit width: {num_v_bits}"
 
         if self._sam is None:
             self._sam = RosaSAM(bsz * num_q_heads)
@@ -83,8 +99,10 @@ class RosaContext:
             assert self.num_q_bits == num_q_bits
             assert self.num_k_bits == num_k_bits
             assert self.num_v_bits == num_v_bits
-    
-    def _dispatch(self, query: Tensor, key: Tensor, value: Tensor):
+
+    def _dispatch(
+        self, query: Tensor, key: Tensor, value: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         self._init_sam(query=query, key=key, value=value)
 
         xq = quantize(query)
@@ -95,16 +113,18 @@ class RosaContext:
             xq = xq.to("cpu", non_blocking=True)
             xk = xk.to("cpu", non_blocking=True)
             xv = xv.to("cpu", non_blocking=True)
-        
+
         return xq, xk, xv
 
-    def _combine(self, xq: Tensor, xk: Tensor, xv: Tensor, mismatch: int = 0):
+    def _combine(
+        self, xq: Tensor, xk: Tensor, xv: Tensor, mismatch: int = 0
+    ) -> Tensor:
         self.stream.synchronize()
 
         bsz, num_q_heads, seq_len = xq.size()
         bsz, num_k_heads, seq_len = xk.size()
         bsz, num_v_heads, seq_len = xv.size()
-        
+
         n_rep = num_q_heads // num_k_heads
         if n_rep > 1:
             xk = xk.view(bsz, num_k_heads, 1, seq_len).repeat(1, 1, n_rep, 1)
@@ -117,20 +137,21 @@ class RosaContext:
         xo = self._sam.update(xq, xk, xv, mismatch)
 
         with self.stream(prev_wait=False):
-            # xo = xo.to(self.device, non_blocking=True)
-            xo = xo.to(self.device) # TODO: fix this
-        
+            xo = xo.to(self.device)
+
         xo = dequantize(xo, self.num_v_bits).to(self.dtype)
         xo = xo.view(bsz, num_q_heads, seq_len, self.num_v_bits)
         return xo
-    
-    def _inspect(self, xq: Tensor, xk: Tensor, xv: Tensor, mismatch: int = 0) -> Tuple[Tensor, Dict[str, Tensor]]:
+
+    def _inspect(
+        self, xq: Tensor, xk: Tensor, xv: Tensor, mismatch: int = 0
+    ) -> Tuple[Tensor, Dict[str, Tensor]]:
         self.stream.synchronize()
 
         bsz, num_q_heads, seq_len = xq.size()
         bsz, num_k_heads, seq_len = xk.size()
         bsz, num_v_heads, seq_len = xv.size()
-        
+
         n_rep = num_q_heads // num_k_heads
         if n_rep > 1:
             xk = xk.view(bsz, num_k_heads, 1, seq_len).repeat(1, 1, n_rep, 1)
@@ -144,39 +165,43 @@ class RosaContext:
 
         with self.stream(prev_wait=False):
             xo = xo.to(self.device, non_blocking=True)
-            info = {key: val.to(self.device, non_blocking=True) for key, val in info.items()}
-        
+            info = {
+                key: val.to(self.device, non_blocking=True) for key, val in info.items()
+            }
+
         xo = dequantize(xo, self.num_v_bits).to(self.dtype)
         xo = xo.view(bsz, num_q_heads, seq_len, self.num_v_bits)
         info = {key: val.view(bsz, num_q_heads, seq_len) for key, val in info.items()}
         return xo, info
 
     @property
-    def stream(self):
+    def stream(self) -> "RosaStream":
         return self._stream()
-    
+
     @staticmethod
     @lru_cache(maxsize=None)
-    def _stream():
+    def _stream() -> "RosaStream":
         return RosaStream()
 
 
 class RosaStream:
+    """Manages CUDA streams for asynchronous operations."""
+
     def __init__(self):
         if torch.cuda.is_available():
             self.stream = torch.cuda.Stream()
         else:
             self.stream = None
-    
+
     def synchronize(self):
         if self.stream is not None:
             self.stream.synchronize()
-    
+
     @contextmanager
     def __call__(
-            self,
-            prev_wait: bool = True,
-            post_wait: bool = True,
+        self,
+        prev_wait: bool = True,
+        post_wait: bool = True,
     ):
         if self.stream is None:
             yield
@@ -186,43 +211,46 @@ class RosaStream:
 
             with torch.cuda.stream(self.stream):
                 yield self.stream
-        
+
             if post_wait:
                 torch.cuda.current_stream().wait_stream(self.stream)
-            
+
 
 class RosaSAM:
+    """Wrapper for the C++ Suffix Automaton implementation."""
+
     def __init__(self, n_ctx: int = 1):
         assert n_ctx >= 0
         self._objs = torch.zeros(n_ctx, dtype=torch.int64, device="cpu")
         self._objs = rosa_sam_init(self._objs)
-    
+
     def __del__(self):
         try:
             rosa_sam_free(self._objs)
         except (AttributeError, TypeError):
             pass
-    
+
     def __len__(self):
         return self._objs.numel()
-    
+
     def update(self, q: Tensor, k: Tensor, v: Tensor, u: int) -> Tensor:
         xq = q.to(torch.int64)
         xk = k.to(torch.int64)
         xv = v.to(torch.int64)
         xo = rosa_sam_update(self._objs, xq, xk, xv, u)
         return xo.to(v.dtype)
-    
-    def inspect(self, q: Tensor, k: Tensor, v: Tensor, u: int) -> Tuple[Tensor, Dict[str, Tensor]]:
+
+    def inspect(
+        self, q: Tensor, k: Tensor, v: Tensor, u: int
+    ) -> Tuple[Tensor, Dict[str, Tensor]]:
         xq = q.to(torch.int64)
         xk = k.to(torch.int64)
         xv = v.to(torch.int64)
         xo, endpos, length = rosa_sam_inspect(self._objs, xq, xk, xv, u)
-        
+
         xo = xo.to(v.dtype)
         info = {
             "endpos": endpos,
             "length": length,
         }
         return xo, info
-    

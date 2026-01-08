@@ -288,7 +288,7 @@ torch::Tensor torch_rosa_sam_forward(const torch::Tensor& q, const torch::Tensor
 }
 
 
-TORCH_LIBRARY(rosa_cpp, m) {
+TORCH_LIBRARY(rosa, m) {
     m.def("rosa_sam_init(Tensor ctx) -> Tensor");
     m.def("rosa_sam_free(Tensor ctx) -> Tensor");
     m.def("rosa_sam_update(Tensor ctx, Tensor q, Tensor k, Tensor v, int u) -> Tensor");
@@ -298,7 +298,7 @@ TORCH_LIBRARY(rosa_cpp, m) {
     m.def("rosa_gss_forward(Tensor q, Tensor k, Tensor v, int u, int num_samples, float tau) -> (Tensor, Tensor, Tensor, Tensor)");
 }
 
-TORCH_LIBRARY_IMPL(rosa_cpp, CPU, m) {
+TORCH_LIBRARY_IMPL(rosa, CPU, m) {
     m.impl("rosa_sam_init", &torch_rosa_sam_init<int64_t, int64_t, int64_t>);
     m.impl("rosa_sam_free", &torch_rosa_sam_free<int64_t, int64_t, int64_t>);
     m.impl("rosa_sam_update", &torch_rosa_sam_update<int64_t, int64_t, int64_t>);
